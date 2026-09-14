@@ -879,50 +879,27 @@
           console.warn('极速网关即时写入:', eGateway);
         }
 
-        // 1. 同步保存到 Ploveooo.github.io
-        let shaPages = currentShaPages;
-        if (!shaPages) {
-          const res = await fetch(`https://api.github.com/repos/${REPO_PAGES}/contents/auth.json`, {
-            headers: { 'Authorization': `token ${GITHUB_TOKEN}` }
-          });
-          if (res.ok) {
-            const d = await res.json();
-            shaPages = d.sha;
-          }
+        // 1. 辅助函数：实时获取目标仓库 auth.json 的最新最新 SHA（加时间戳彻底禁用缓存，根除 409 冲突）
+        async function getFreshSha(repo) {
+          try {
+            const res = await fetch(`https://api.github.com/repos/${repo}/contents/auth.json?_t=${Date.now()}`, {
+              headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github.v3+json'
+              },
+              cache: 'no-store'
+            });
+            if (res.ok) {
+              const d = await res.json();
+              return d.sha;
+            }
+          } catch (e) {}
+          return null;
         }
 
-        const putPages = await fetch(`https://api.github.com/repos/${REPO_PAGES}/contents/auth.json`, {
-          method: 'PUT',
-          headers: {
-            'Authorization': `token ${GITHUB_TOKEN}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            message: 'update auth config from Web Console',
-            content: contentB64,
-            sha: shaPages,
-            branch: 'main'
-          })
-        });
-
-        if (!putPages.ok) {
-          const err = await putPages.json();
-          throw new Error(err.message || '保存到 GitHub Pages 失败');
-        }
-        const putPagesData = await putPages.json();
-        currentShaPages = putPagesData.content.sha;
-
-        // 2. 尝试同步保存到 plove-auth
-        try {
-          const resAuth = await fetch(`https://api.github.com/repos/${REPO_AUTH}/contents/auth.json`, {
-            headers: { 'Authorization': `token ${GITHUB_TOKEN}` }
-          });
-          let shaAuth = null;
-          if (resAuth.ok) {
-            const d = await resAuth.json();
-            shaAuth = d.sha;
-          }
-          await fetch(`https://api.github.com/repos/${REPO_AUTH}/contents/auth.json`, {
+        async function putWithRetry(repo, b64Content) {
+          let sha = await getFreshSha(repo);
+          let putRes = await fetch(`https://api.github.com/repos/${repo}/contents/auth.json`, {
             method: 'PUT',
             headers: {
               'Authorization': `token ${GITHUB_TOKEN}`,
@@ -930,11 +907,45 @@
             },
             body: JSON.stringify({
               message: 'update auth config from Web Console',
-              content: contentB64,
-              sha: shaAuth,
+              content: b64Content,
+              sha: sha,
               branch: 'main'
             })
           });
+
+          // 如果遇到 409 Conflict (SHA 不匹配)，立即重新拉取最新的 SHA 重试一次
+          if (!putRes.ok && putRes.status === 409) {
+            console.warn(`[${repo}] SHA mismatch detected, re-fetching latest SHA and retrying...`);
+            sha = await getFreshSha(repo);
+            putRes = await fetch(`https://api.github.com/repos/${repo}/contents/auth.json`, {
+              method: 'PUT',
+              headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                message: 'update auth config from Web Console (retry)',
+                content: b64Content,
+                sha: sha,
+                branch: 'main'
+              })
+            });
+          }
+          return putRes;
+        }
+
+        // 1. 保存到 Ploveooo.github.io
+        const putPages = await putWithRetry(REPO_PAGES, contentB64);
+        if (!putPages.ok) {
+          const err = await putPages.json();
+          throw new Error(err.message || '保存到 GitHub Pages 失败');
+        }
+        const putPagesData = await putPages.json();
+        currentShaPages = putPagesData.content ? putPagesData.content.sha : null;
+
+        // 2. 同步保存到 plove-auth
+        try {
+          await putWithRetry(REPO_AUTH, contentB64);
         } catch (e2) {
           console.warn('plove-auth 同步跳过:', e2);
         }
